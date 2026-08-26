@@ -20,6 +20,18 @@ pub enum EngineError {
     },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("download digest mismatch for {url}: expected {expected}, found {found}")]
+    DigestMismatch {
+        url: String,
+        expected: String,
+        found: String,
+    },
+    #[error("archive extraction failed: {0}")]
+    Archive(String),
+    #[error("no patchable steam_api targets found in: {0}")]
+    NoTargetsFound(String),
+    #[error("fetch error: {0}")]
+    Fetch(String),
     #[error("manifest serialization error: {0}")]
     Manifest(#[from] serde_json::Error),
 }
