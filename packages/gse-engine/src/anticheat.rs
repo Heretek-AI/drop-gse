@@ -20,10 +20,10 @@ pub const ANTICHEAT_MARKERS: &[&str] = &[
     "battleye.dll",
 ];
 
-/// Maximum recursion depth below `game_dir`. Game layouts are flat enough
-/// that anti-cheat payloads live close to the executable; deeper trees are
-/// treated as out of scope rather than scanned unboundedly.
-const MAX_SCAN_DEPTH: usize = 4;
+/// Maximum recursion depth below `game_dir`. Shared with target location so
+/// the "anticheat gate covers everything we touch" invariant holds — a
+/// replaceable binary must never sit deeper than the scan reaches.
+pub const MAX_SCAN_DEPTH: usize = 4;
 
 /// Recursively scan `game_dir` for anti-cheat markers.
 ///
