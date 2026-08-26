@@ -12,6 +12,8 @@ pub enum EngineError {
     SteamApiNotFound(String),
     #[error("anti-cheat scan failed (fail closed): {0}")]
     ScanFailed(String),
+    #[error("manifest path escapes game directory (refusing to operate): {0}")]
+    UnsafeManifestPath(String),
     #[error("backup manifest mismatch for {path}: expected {expected}, found {found}")]
     ManifestMismatch {
         path: String,

@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use crate::dll;
 use crate::error::EngineError;
 use crate::EmulatorFlavor;
 
@@ -72,10 +73,15 @@ impl SteamSettings {
     }
 }
 
-/// Atomic per-file write: content goes to a UNIQUE staging name (pid +
-/// monotonic counter) so concurrent invocations can't interleave on a shared
-/// `.tmp`, is flushed to disk before rename so an interrupted write never
-/// leaves a truncated file at the final path.
+/// Atomic durable per-file write.
+///
+/// Content goes to a UNIQUE staging name (pid + monotonic counter) so
+/// concurrent invocations can't interleave on a shared `.tmp`; the content is
+/// fsynced BEFORE the rename and the parent directory is fsynced after it
+/// (best-effort — opening a directory fails on some platforms such as
+/// Windows), so neither process death NOR power loss leaves a truncated file
+/// at the final path. Failures carry the relevant path for triage, and a
+/// failed rename cleans up the staged file.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), EngineError> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,9 +99,63 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), EngineError> {
     })();
     if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(EngineError::Fetch(format!("{}: {e}", tmp.display())));
     }
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // Rename failure would leak the fully-written staging file otherwise.
+        let _ = std::fs::remove_file(&tmp);
+        EngineError::Fetch(format!("{} -> {}: {e}", tmp.display(), path.display()))
+    })?;
+    // Make the RENAME itself durable; without this, power loss on some
+    // filesystems can persist the directory entry without the data blocks.
+    // Best-effort: opening a directory fails on Windows.
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot a pre-existing settings file that WE did not author (no manifest
+/// entry records it) before our first overwrite, as `<name>.orig` alongside
+/// the binaries' backups. Goldberg users legitimately ship/edit
+/// steam_appid.txt and configs.main.ini; teardown can then restore their
+/// content instead of silently discarding it.
+/// Manifest key prefix marking a config file WE own (vs a binary backup).
+/// Namespaced so `restore_originals` — which interprets bare keys as binary
+/// `<key>` → `<key>.orig` pairs — never mistakes these for binaries.
+const CONFIG_KEY_PREFIX: &str = "config:";
+
+fn config_key(name: &str) -> String {
+    format!("{CONFIG_KEY_PREFIX}{name}")
+}
+
+/// Snapshot a pre-existing settings file that WE did not author before our
+/// first overwrite, as `<name>.orig` next to it. Goldberg users legitimately
+/// ship/edit steam_appid.txt and configs.main.ini; teardown restores their
+/// content instead of silently discarding it.
+fn snapshot_user_file_if_untracked(
+    dir: &Path,
+    name: &str,
+    manifest: &mut dll::Manifest,
+    manifest_dirty: &mut bool,
+) -> Result<(), EngineError> {
+    let key = config_key(name);
+    let target = dir.join(name);
+    if !target.exists() || manifest.entries.contains_key(&key) {
+        return Ok(()); // nothing to snapshot, or already ours
+    }
+    let backup = target.with_file_name(format!(
+        "{}.orig",
+        target.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if !backup.exists() {
+        std::fs::copy(&target, &backup)?;
+        let digest = dll::sha256_hex_of(&backup)?;
+        manifest.entries.insert(key, digest);
+        *manifest_dirty = true;
+    }
     Ok(())
 }
 
@@ -103,7 +163,12 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), EngineError> {
 /// and idempotently across runs.
 ///
 /// Files are only rewritten when their content differs, so re-running a patch
-/// does not churn mtimes or risk partial writes.
+/// does not churn mtimes or risk partial writes. A file whose setting became
+/// empty/default this run is REMOVED if we authored it (manifest-tracked) —
+/// leaving stale broadcasts/port overrides active across a downgrade would
+/// be worse than absence. Pre-existing files we did NOT author are snapshotted
+/// to `<name>.orig` before the first overwrite and left alone at teardown of
+/// fields we never claimed.
 pub fn write_steam_settings(
     game_dir: &Path,
     settings: &SteamSettings,
@@ -114,6 +179,11 @@ pub fn write_steam_settings(
     let dir = game_dir.join(STEAM_SETTINGS_DIR);
     std::fs::create_dir_all(&dir)?;
 
+    // The patch manifest doubles as ownership ledger for config files so
+    // snapshot/removal decisions distinguish "ours" from "user-authored".
+    let mut manifest = dll::load_manifest_pub(game_dir)?;
+    let mut manifest_dirty = false;
+
     let mut written = Vec::new();
     let entries: [(&str, Option<String>); 4] = [
         ("steam_appid.txt", Some(settings.render_steam_appid())),
@@ -123,34 +193,105 @@ pub fn write_steam_settings(
     ];
 
     for (name, content_opt) in entries {
-        let Some(content) = content_opt else { continue };
         let path = dir.join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(existing) if existing == content => {} // idempotent no-op
-            _ => {
-                atomic_write(&path, &content)?;
-                written.push(path);
+        match content_opt {
+            None => {
+                // Setting reverted to empty/default: drop OUR previous output
+                // rather than leaving stale broadcasts/port overrides active.
+                // Never delete a file we didn't author.
+                let key = config_key(name);
+                if path.exists() && manifest.entries.contains_key(&key) {
+                    std::fs::remove_file(&path)?;
+                    // Also remove our snapshot so teardown is fully clean.
+                    let backup = path.with_file_name(format!(
+                        "{}.orig",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    if backup.exists() {
+                        std::fs::remove_file(&backup)?;
+                    }
+                    manifest.entries.remove(&key);
+                    manifest_dirty = true;
+                }
+            }
+            Some(content) => {
+                snapshot_user_file_if_untracked(&dir, name, &mut manifest, &mut manifest_dirty)?;
+                match std::fs::read_to_string(&path) {
+                    Ok(existing) if existing == content => {} // idempotent no-op
+                    _ => {
+                        atomic_write(&path, &content)?;
+                        // We own this file from here on (snapshot above ran).
+                        let key = config_key(name);
+                        if !manifest.entries.contains_key(&key) {
+                            let digest = dll::sha256_hex_of(&path)?;
+                            manifest.entries.insert(key.clone(), digest);
+                            manifest_dirty = true;
+                        }
+                        written.push(path);
+                    }
+                }
             }
         }
+    }
+
+    // Reuse the binary-manifest persistence path (same file, shared ledger).
+    // Config digests here track that we OWN the entry, not exact content —
+    // content equality is checked directly above before overwriting.
+    if manifest_dirty {
+        dll::save_manifest_pub(game_dir, &manifest)?;
     }
     Ok(written)
 }
 
-/// Remove files written by [`write_steam_settings`] that we own. Only deletes
-/// the four known filenames inside `steam_settings/`; never touches unknown
-/// user content (achievements, items.json, etc.).
+/// Remove files written by [`write_steam_settings`] that we own and restore
+/// snapshotted user-authored content. Only the four known filenames inside
+/// `steam_settings/` are considered; unknown user content (achievements,
+/// items.json, …) is never touched.
+///
+/// For each managed name:
+/// - We authored it AND a user snapshot exists (`<name>.orig`, recorded via
+///   the `config:` manifest namespace) → restore the snapshot (digest-verified
+///   against the recorded pre-overwrite content) instead of deleting.
+/// - We authored it, no snapshot → delete (we created the file outright).
+/// - No manifest entry → not ours; leave untouched.
 pub fn remove_steam_settings(game_dir: &Path) -> Result<(), EngineError> {
     let dir = game_dir.join(STEAM_SETTINGS_DIR);
+    let mut manifest = dll::load_manifest_pub(game_dir)?;
+    let mut dirty = false;
     for name in [
         "steam_appid.txt",
         "custom_broadcasts.txt",
         "steam_interfaces.txt",
         "configs.main.ini",
     ] {
+        let key = config_key(name);
+        let Some(recorded) = manifest.entries.get(&key) else {
+            continue; // never authored/snapshotted by us — leave untouched
+        };
         let path = dir.join(name);
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
+        // Restore the user's pre-patch file if we snapshotted one.
+        let backup = path.with_file_name(format!(
+            "{}.orig",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if backup.exists() {
+            let digest = dll::sha256_hex_of(&backup).unwrap_or_default();
+            if digest == *recorded {
+                std::fs::rename(&backup, &path)?; // restore user content
+            } else {
+                // Snapshot tampered: refuse to resurrect possibly-wrong
+                // content; drop both and report through the manifest state.
+                std::fs::remove_file(&backup)?;
+            }
+        }
+        manifest.entries.remove(&key);
+        dirty = true;
+    }
+    if dirty {
+        dll::save_manifest_pub(game_dir, &manifest)?;
     }
     Ok(())
 }
@@ -256,5 +397,83 @@ mod tests {
             write_steam_settings(&missing, &sample_settings()),
             Err(EngineError::GameDirNotFound(_))
         ));
+    }
+
+    #[test]
+    fn user_authored_file_is_snapshotted_and_restored() {
+        let dir = tmpdir("user-snap");
+        let settings_dir = dir.path().join(STEAM_SETTINGS_DIR);
+        fs::create_dir_all(&settings_dir).unwrap();
+        // Game ships with a user-edited appid config.
+        fs::write(settings_dir.join("steam_appid.txt"), b"1234\n").unwrap();
+
+        let mut s = sample_settings();
+        s.custom_broadcasts.clear(); // keep this test focused on appid
+        write_steam_settings(dir.path(), &s).unwrap();
+
+        // Overwritten live, but the user's content is snapshotted.
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("steam_appid.txt")).unwrap(),
+            "480\n"
+        );
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("steam_appid.txt.orig")).unwrap(),
+            "1234\n"
+        );
+
+        // Teardown restores the user's file rather than deleting it.
+        remove_steam_settings(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("steam_appid.txt")).unwrap(),
+            "1234\n"
+        );
+        assert!(!settings_dir.join("steam_appid.txt.orig").exists());
+    }
+
+    #[test]
+    fn downgrade_removes_stale_managed_file_but_not_user_file() {
+        let dir = tmpdir("downgrade");
+        // First run: broadcasts set → custom_broadcasts.txt written (owned).
+        let mut s1 = sample_settings();
+        s1.interfaces.clear(); // focus on broadcasts
+        write_steam_settings(dir.path(), &s1).unwrap();
+        assert!(dir
+            .path()
+            .join(STEAM_SETTINGS_DIR)
+            .join("custom_broadcasts.txt")
+            .exists());
+
+        // Second run: field empty → our stale output must be removed.
+        let mut s2 = sample_settings();
+        s2.interfaces.clear();
+        s2.custom_broadcasts.clear();
+        write_steam_settings(dir.path(), &s2).unwrap();
+        assert!(
+            !dir.path()
+                .join(STEAM_SETTINGS_DIR)
+                .join("custom_broadcasts.txt")
+                .exists(),
+            "stale managed broadcast file must not survive a downgrade"
+        );
+    }
+
+    #[test]
+    fn unauthored_empty_field_file_is_left_alone() {
+        let dir = tmpdir("unauthored");
+        let settings_dir = dir.path().join(STEAM_SETTINGS_DIR);
+        fs::create_dir_all(&settings_dir).unwrap();
+        // A user-authored custom_broadcasts.txt that we never wrote.
+        fs::write(settings_dir.join("custom_broadcasts.txt"), b"10.0.0.1\n").unwrap();
+
+        let mut s = sample_settings();
+        s.interfaces.clear();
+        s.custom_broadcasts.clear(); // would render None
+        write_steam_settings(dir.path(), &s).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("custom_broadcasts.txt")).unwrap(),
+            "10.0.0.1\n",
+            "files we never authored must survive even on downgrade"
+        );
     }
 }
