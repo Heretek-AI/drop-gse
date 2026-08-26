@@ -5,14 +5,14 @@ Core emulator patching engine for `drop-gse` (spec:
 
 ## Modules
 
-| Module | Responsibility |
-| --- | --- |
-| `anticheat` | Fail-closed pre-flight gate — refuses to patch when EAC/BattlEye markers are present or the scan itself fails |
-| `dll` | Hash-manifested backup (`<name>.orig` + `.drop-gse-manifest.json`), replace, verified restore |
-| `interfaces` | SteamRoll-style extraction of Steam interface version strings from the ORIGINAL binary (64 KiB chunks, 1 KiB overlap, sorted+deduped) |
-| `fetch` | Pinned-release download (`releases/download/<tag>/<asset>`, never "latest") with SHA-256 verification and digest-keyed cache; extracts `release/regular/<arch>/<lib>` from gbe_fork archives |
-| `config` | Atomic, idempotent `steam_settings/` writer (`steam_appid.txt`, `custom_broadcasts.txt`, `steam_interfaces.txt`, minimal `configs.main.ini`) and teardown that only removes engine-owned files |
-| `patch` | Orchestration: anticheat gate → locate targets → extract interfaces from original → backup → replace → configure. Idempotent re-runs preserve verified originals (`BackupState::AlreadyPatched`) |
+| Module       | Responsibility                                                                                                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `anticheat`  | Fail-closed pre-flight gate — refuses to patch when EAC/BattlEye markers are present or the scan itself fails                                                                                    |
+| `dll`        | Hash-manifested backup (`<name>.orig` + `.drop-gse-manifest.json`), replace, verified restore                                                                                                    |
+| `interfaces` | SteamRoll-style extraction of Steam interface version strings from the ORIGINAL binary (64 KiB chunks, 1 KiB overlap, sorted+deduped)                                                            |
+| `fetch`      | Pinned-release download (`releases/download/<tag>/<asset>`, never "latest") with SHA-256 verification and digest-keyed cache; extracts `release/regular/<arch>/<lib>` from gbe_fork archives     |
+| `config`     | Atomic, idempotent `steam_settings/` writer (`steam_appid.txt`, `custom_broadcasts.txt`, `steam_interfaces.txt`, minimal `configs.main.ini`) and teardown that only removes engine-owned files   |
+| `patch`      | Orchestration: anticheat gate → locate targets → extract interfaces from original → backup → replace → configure. Idempotent re-runs preserve verified originals (`BackupState::AlreadyPatched`) |
 
 ## CLI
 
