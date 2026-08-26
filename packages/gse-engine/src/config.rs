@@ -10,7 +10,6 @@
 use std::path::Path;
 
 use crate::error::EngineError;
-use crate::interfaces;
 use crate::EmulatorFlavor;
 
 /// Default emulator announce/listen port (gbe_fork `DEFAULT_PORT`).
@@ -33,27 +32,13 @@ pub struct SteamSettings {
 }
 
 impl SteamSettings {
-    /// Extract interfaces from `original_dll` and build settings around them.
-    pub fn from_original_dll(
-        app_id: u32,
-        original_dll: &Path,
-        custom_broadcasts: Vec<String>,
-    ) -> Result<Self, EngineError> {
-        Ok(Self {
-            app_id,
-            interfaces: interfaces::extract_interfaces(original_dll)?,
-            custom_broadcasts,
-            listen_port: None,
-        })
-    }
-
-    pub fn render_custom_broadcasts(&self) -> String {
+    /// `None` when there are no peers — omitting the file entirely beats
+    /// writing an empty one.
+    pub fn render_custom_broadcasts(&self) -> Option<String> {
         if self.custom_broadcasts.is_empty() {
-            String::new()
+            None
         } else {
-            let mut s = self.custom_broadcasts.join("\n");
-            s.push('\n');
-            s
+            Some(format!("{}\n", self.custom_broadcasts.join("\n")))
         }
     }
 
@@ -61,13 +46,14 @@ impl SteamSettings {
         format!("{}\n", self.app_id)
     }
 
-    pub fn render_steam_interfaces(&self) -> String {
+    /// `None` when no interfaces were found: an empty steam_interfaces.txt
+    /// would silently disable every emulator hook. (patch() also errors on
+    /// empty before reaching here; this guards direct library callers.)
+    pub fn render_steam_interfaces(&self) -> Option<String> {
         if self.interfaces.is_empty() {
-            String::new()
+            None
         } else {
-            let mut s = self.interfaces.join("\n");
-            s.push('\n');
-            s
+            Some(format!("{}\n", self.interfaces.join("\n")))
         }
     }
 
@@ -86,9 +72,29 @@ impl SteamSettings {
     }
 }
 
+/// Atomic per-file write: content goes to a UNIQUE staging name (pid +
+/// monotonic counter) so concurrent invocations can't interleave on a shared
+/// `.tmp`, is flushed to disk before rename so an interrupted write never
+/// leaves a truncated file at the final path.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), EngineError> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?; // durable content before the rename makes it visible
+        Ok(())
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -111,14 +117,8 @@ pub fn write_steam_settings(
     let mut written = Vec::new();
     let entries: [(&str, Option<String>); 4] = [
         ("steam_appid.txt", Some(settings.render_steam_appid())),
-        (
-            "custom_broadcasts.txt",
-            Some(settings.render_custom_broadcasts()),
-        ),
-        (
-            "steam_interfaces.txt",
-            Some(settings.render_steam_interfaces()),
-        ),
+        ("custom_broadcasts.txt", settings.render_custom_broadcasts()),
+        ("steam_interfaces.txt", settings.render_steam_interfaces()),
         ("configs.main.ini", settings.render_configs_main()),
     ];
 
@@ -160,10 +160,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("gse-cfgtest-{tag}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmpdir(tag: &str) -> tempfile::TempDir {
+        tempfile::TempDir::with_prefix(format!("gse-cfgtest-{tag}-")).expect("unique temp dir")
     }
 
     fn sample_settings() -> SteamSettings {
@@ -178,26 +176,37 @@ mod tests {
     #[test]
     fn writes_full_set() {
         let dir = tmpdir("write");
-        write_steam_settings(&dir, &sample_settings()).unwrap();
+        write_steam_settings(dir.path(), &sample_settings()).unwrap();
 
         assert_eq!(
-            fs::read_to_string(dir.join(STEAM_SETTINGS_DIR).join("steam_appid.txt")).unwrap(),
+            fs::read_to_string(dir.path().join(STEAM_SETTINGS_DIR).join("steam_appid.txt"))
+                .unwrap(),
             "480\n"
         );
         assert_eq!(
-            fs::read_to_string(dir.join(STEAM_SETTINGS_DIR).join("custom_broadcasts.txt")).unwrap(),
+            fs::read_to_string(
+                dir.path()
+                    .join(STEAM_SETTINGS_DIR)
+                    .join("custom_broadcasts.txt")
+            )
+            .unwrap(),
             "100.64.0.2\n100.64.0.3\n"
         );
         assert_eq!(
-            fs::read_to_string(dir.join(STEAM_SETTINGS_DIR).join("steam_interfaces.txt")).unwrap(),
+            fs::read_to_string(
+                dir.path()
+                    .join(STEAM_SETTINGS_DIR)
+                    .join("steam_interfaces.txt")
+            )
+            .unwrap(),
             "SteamUser021\nSteamNetworking005\n"
         );
         // Default port → no INI written at all.
         assert!(!dir
+            .path()
             .join(STEAM_SETTINGS_DIR)
             .join("configs.main.ini")
             .exists());
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -205,45 +214,44 @@ mod tests {
         let dir = tmpdir("port");
         let mut s = sample_settings();
         s.listen_port = Some(47585);
-        write_steam_settings(&dir, &s).unwrap();
-        let ini =
-            fs::read_to_string(dir.join(STEAM_SETTINGS_DIR).join("configs.main.ini")).unwrap();
+        write_steam_settings(dir.path(), &s).unwrap();
+        let ini = fs::read_to_string(dir.path().join(STEAM_SETTINGS_DIR).join("configs.main.ini"))
+            .unwrap();
         assert!(ini.contains("[main::connectivity]"));
         assert!(ini.contains("listen_port=47585"));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn rewrite_is_idempotent() {
         let dir = tmpdir("idem");
         let s = sample_settings();
-        let first = write_steam_settings(&dir, &s).unwrap();
+        let first = write_steam_settings(dir.path(), &s).unwrap();
         assert_eq!(first.len(), 3);
-        let second = write_steam_settings(&dir, &s).unwrap();
+        let second = write_steam_settings(dir.path(), &s).unwrap();
         assert!(second.is_empty(), "identical content must not rewrite");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn remove_only_touches_owned_files() {
         let dir = tmpdir("remove");
-        write_steam_settings(&dir, &sample_settings()).unwrap();
-        let keep = dir.join(STEAM_SETTINGS_DIR).join("items.json");
+        write_steam_settings(dir.path(), &sample_settings()).unwrap();
+        let keep = dir.path().join(STEAM_SETTINGS_DIR).join("items.json");
         fs::write(&keep, b"{}").unwrap();
 
-        remove_steam_settings(&dir).unwrap();
+        remove_steam_settings(dir.path()).unwrap();
 
         assert!(!dir
+            .path()
             .join(STEAM_SETTINGS_DIR)
             .join("steam_appid.txt")
             .exists());
         assert!(keep.exists(), "user content must survive teardown");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn missing_game_dir_is_error() {
-        let missing = std::env::temp_dir().join("gse-cfgtest-missing-dir");
+        let tmp = tmpdir("missing");
+        let missing = tmp.path().join("does-not-exist");
         assert!(matches!(
             write_steam_settings(&missing, &sample_settings()),
             Err(EngineError::GameDirNotFound(_))

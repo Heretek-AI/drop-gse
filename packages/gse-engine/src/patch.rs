@@ -106,8 +106,21 @@ pub fn patch(
         return Err(EngineError::NoTargetsFound(game_dir.display().to_string()));
     }
 
+    // 2b. Fail fast BEFORE any mutation: every locatable target must resolve
+    //     to a payload, otherwise the swap loop would abort half-way through
+    //     with a partially patched game and a mutated manifest.
+    for path in &target_paths {
+        let key = file_name(path).to_lowercase();
+        if !emulator_payloads.contains_key(key.as_str()) {
+            return Err(EngineError::Fetch(format!(
+                "no emulator payload provided for {key} — refusing to start \
+                 a partial patch"
+            )));
+        }
+    }
+
     let mut targets = std::collections::BTreeMap::new();
-    let mut interfaces = Vec::new();
+    let mut interfaces: Vec<String> = Vec::new();
 
     for path in &target_paths {
         let rel = path
@@ -130,14 +143,18 @@ pub fn patch(
 
         // 3a. Interfaces must come from the ORIGINAL binary — prefer the
         //     verified `.orig` when present, else the not-yet-replaced file.
-        if interfaces.is_empty() {
+        //     Union across ALL targets: dual-ABI layouts (steam_api.dll +
+        //     steam_api64.dll) can embed different interface families per
+        //     binary; extracting only the first-sorted one silently drops
+        //     hooks the other variant needs.
+        {
             let orig_abs = game_dir.join(&rel_backup);
             let source = if orig_abs.exists() {
                 orig_abs
             } else {
                 path.clone()
             };
-            interfaces = crate::interfaces::extract_interfaces(&source)?;
+            interfaces.extend(crate::interfaces::extract_interfaces(&source)?);
         }
 
         match outcome.state(rel.as_str()) {
@@ -163,7 +180,19 @@ pub fn patch(
         }
     }
 
-    // 5. Write steam_settings (atomic per-file, idempotent).
+    // 5. Write steam_settings (atomic per-file, idempotent). Interfaces are
+    //    deduped+sorted across all targets; an EMPTY result is an error —
+    //    extraction finding nothing recognizable means the original binary
+    //    wasn't a steam_api payload, and an empty steam_interfaces.txt would
+    //    silently disable every emulator hook.
+    if interfaces.is_empty() {
+        return Err(EngineError::NoTargetsFound(format!(
+            "no Steam interface names found in any original binary under {}",
+            game_dir.display()
+        )));
+    }
+    interfaces.sort();
+    interfaces.dedup();
     let settings = SteamSettings {
         app_id: plan.app_id,
         custom_broadcasts: plan.broadcast_peers.clone(),

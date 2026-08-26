@@ -175,8 +175,16 @@ pub fn backup_originals(game_dir: &Path, binaries: &[&str]) -> Result<BackupOutc
 /// 3. **Clean up**: delete each `.orig` and persist the manifest immediately
 ///    after each successful removal, so an interrupted cleanup resumes with
 ///    only the remaining entries and never requires already-deleted backups.
+///
+/// Every name is validated as a safe relative path first: absolute paths or
+/// any `..` component would make verify/copy/cleanup operate OUTSIDE
+/// `game_dir`. Manifest keys are normally written by our own backup flow,
+/// but the manifest file is untrusted input at restore time.
 pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), EngineError> {
     ensure_game_dir(game_dir)?;
+    for name in binaries {
+        validate_relative_path(name)?;
+    }
     let mut manifest = load_manifest(game_dir)?;
 
     // Phase 1: verify all tracked backups before touching anything.
@@ -223,6 +231,19 @@ pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), Engin
     Ok(())
 }
 
+/// Reject absolute paths or any path with a `..` component. Manifest keys
+/// are untrusted input at restore time; without this check a crafted key
+/// would make verify/copy/cleanup operate outside `game_dir`.
+fn validate_relative_path(name: &str) -> Result<(), EngineError> {
+    let p = Path::new(name);
+    if p.is_absolute() || name.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(EngineError::ScanFailed(format!(
+            "manifest path escapes game directory: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Restore EVERY entry recorded in the manifest, whatever its on-disk casing
 /// or nesting. `restore_originals` filters by an explicit name list (canonical
 /// lowercase), which would silently skip a manifest entry like
@@ -230,6 +251,9 @@ pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), Engin
 /// keys backup wrote — so nothing patched is ever left unrestored.
 pub fn restore_all_tracked(game_dir: &Path) -> Result<(), EngineError> {
     let manifest = load_manifest(game_dir)?;
+    for key in manifest.entries.keys() {
+        validate_relative_path(key)?;
+    }
     let tracked: Vec<&str> = manifest.entries.keys().map(String::as_str).collect();
     restore_originals(game_dir, &tracked)
 }

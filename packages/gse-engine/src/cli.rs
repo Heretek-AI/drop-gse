@@ -103,7 +103,8 @@ async fn download(url: String, dest: PathBuf) -> Result<(), EngineError> {
     }
 
     // Unique staging name: same directory (same filesystem → atomic rename),
-    // pid + monotonic counter suffix.
+    // pid + monotonic counter suffix. Removed on ANY failure so failed or
+    // interrupted attempts don't accumulate partial artifacts.
     use std::sync::atomic::{AtomicU64, Ordering};
     static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
     let staging = dest.with_extension(format!(
@@ -111,20 +112,30 @@ async fn download(url: String, dest: PathBuf) -> Result<(), EngineError> {
         std::process::id(),
         STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = tokio::fs::File::create(&staging)
-        .await
-        .map_err(EngineError::from)?;
-    let mut stream = response;
-    while let Some(chunk) = stream
-        .chunk()
-        .await
-        .map_err(|e| EngineError::Fetch(format!("{url}: {e}")))?
-    {
+    // Scope the file handle so it's closed before rename; flush once after
+    // the loop (per-chunk flushing adds an await with no durability gain).
+    let download_result: Result<(), EngineError> = async {
         use tokio::io::AsyncWriteExt;
-        file.write_all(&chunk).await.map_err(EngineError::from)?;
+        let mut file = tokio::fs::File::create(&staging)
+            .await
+            .map_err(EngineError::from)?;
+        let mut stream = response;
+        while let Some(chunk) = stream
+            .chunk()
+            .await
+            .map_err(|e| EngineError::Fetch(format!("{url}: {e}")))?
+        {
+            file.write_all(&chunk).await.map_err(EngineError::from)?;
+        }
         file.flush().await.map_err(EngineError::from)?;
+        Ok(())
     }
-    drop(file);
+    .await;
+
+    if let Err(err) = download_result {
+        let _ = tokio::fs::remove_file(&staging).await; // no partial leftovers
+        return Err(err);
+    }
     tokio::fs::rename(&staging, &dest)
         .await
         .map_err(EngineError::from)?;
@@ -156,11 +167,7 @@ pub fn run(cli: Cli) -> Result<String, EngineError> {
                 .build()
                 .map_err(|e| EngineError::Fetch(format!("runtime: {e}")))?;
 
-            let spec = fetch::ReleaseSpec {
-                tag,
-                asset_name: asset,
-                sha256: digest.to_lowercase(),
-            };
+            let spec = fetch::ReleaseSpec::new(tag, asset, digest.to_lowercase())?;
             let cache = cache_dir.unwrap_or_else(default_cache_dir);
             let archive = rt.block_on(fetch::ensure_cached(&cache, &spec, download))?;
 
@@ -170,36 +177,20 @@ pub fn run(cli: Cli) -> Result<String, EngineError> {
             let extract_root = cache.join(format!("extracted-{}", spec.sha256));
             extract_archive(&archive, &extract_root, &spec.asset_name)?;
 
-            // Map target names → extracted payload paths. Each target binary
-            // resolves against its OWN ABI folder in the archive (32-bit
-            // `steam_api.dll` lives under x32 even on an x86_64 host);
-            // targets whose payload is absent from the pinned archive are
-            // omitted so patch() skips them rather than half-failing after
-            // backups have started.
+            // Map target names → extracted payload paths via the fetch helper
+            // (single source of truth for the archive layout). Resolution is
+            // per-TARGET ABI; absent payloads are omitted — patch() itself
+            // prevalidates and refuses to start if any located target would
+            // lack one.
             let mut payloads = BTreeMap::new();
-            for lib in dll::TARGET_BINARIES {
-                let abi = match target_abi_folder(lib) {
-                    Some(a) => a,
-                    None => continue, // unsupported ABI for this binary
-                };
-                // Construct the single payload path directly — no unwrap/expect
-                // in production plumbing.
-                let p = extract_root
-                    .join("release")
-                    .join("regular")
-                    .join(abi)
-                    .join(lib);
-                if p.exists() {
-                    payloads.insert(lib.to_string(), p);
+            for (lib, path) in fetch::emulator_payload_paths(
+                &extract_root,
+                target_abi_folder,
+                dll::TARGET_BINARIES,
+            ) {
+                if path.exists() {
+                    payloads.insert(lib, path);
                 }
-            }
-            if payloads.is_empty() {
-                return Err(EngineError::Fetch(format!(
-                    "pinned archive {} contains none of the required payloads \
-                     for this platform ({})",
-                    spec.asset_name,
-                    std::env::consts::ARCH,
-                )));
             }
 
             let plan = PatchPlan {

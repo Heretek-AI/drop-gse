@@ -35,6 +35,35 @@ pub struct ReleaseSpec {
 }
 
 impl ReleaseSpec {
+    /// Build a validated spec: `sha256` must be exactly 64 lowercase hex
+    /// chars; `tag`/`asset_name` must not contain path separators or `..`
+    /// (they are interpolated into a download URL and cache filenames, so a
+    /// crafted value must not be able to escape either).
+    pub fn new(tag: String, asset_name: String, sha256: String) -> Result<Self, EngineError> {
+        let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        if sha256.len() != 64 || !sha256.bytes().all(is_hex) {
+            return Err(EngineError::Fetch(format!(
+                "invalid sha256 digest {sha256:?}: expected 64 lowercase hex chars"
+            )));
+        }
+        for (label, value) in [("tag", &tag), ("asset", &asset_name)] {
+            if value.is_empty()
+                || value.contains(['/', '\\'])
+                || value.split(['/', '\\']).any(|seg| seg == "..")
+                || value.contains("..")
+            {
+                return Err(EngineError::Fetch(format!(
+                    "invalid release {label} {value:?}: path separators and '..' are not allowed"
+                )));
+            }
+        }
+        Ok(Self {
+            tag,
+            asset_name,
+            sha256,
+        })
+    }
+
     pub fn url(&self) -> String {
         format!("{GBE_RELEASES_BASE}/{}/{}", self.tag, self.asset_name)
     }
@@ -70,41 +99,61 @@ where
     Fut: std::future::Future<Output = Result<(), EngineError>>,
 {
     let cached = cache_path(cache_dir, spec);
+    // Verified cache hit — otherwise fall through and re-download below.
     if cached.is_file() && sha256_of(&cached).await? == spec.sha256 {
-        return Ok(cached); // verified cache hit
-                           // Corrupt/partial cache entry — fall through and re-download.
+        return Ok(cached);
     }
 
     fs::create_dir_all(cache_dir).await?;
-    download_to(spec.url(), cached.clone()).await?;
+    // Download to a STAGING path first; the caller's downloader is responsible
+    // for atomic placement at that staging path. The final digest-keyed name
+    // only ever appears once the artifact has passed verification below, so
+    // concurrent invocations can't observe each other's partial writes.
+    let staging = cached.with_extension("staging");
+    download_to(spec.url(), staging.clone()).await?;
 
-    let actual = sha256_of(&cached).await?;
+    let actual = sha256_of(&staging).await?;
     if actual != spec.sha256 {
         // Remove bad artifact immediately so nothing downstream trusts it.
-        let _ = fs::remove_file(&cached).await;
+        let _ = fs::remove_file(&staging).await;
         return Err(EngineError::DigestMismatch {
             url: spec.url(),
             expected: spec.sha256.clone(),
             found: actual,
         });
     }
+    // Digest verified at the staging path — only NOW does it earn the final
+    // digest-keyed name (atomic within the same filesystem).
+    fs::rename(&staging, &cached).await?;
     Ok(cached)
 }
 
 /// Locate `wanted` files inside the archive root once extracted, returning
-/// their paths under `extract_dir`. gbe_fork archives nest payload DLLs at
-/// `release/regular/<arch>/<name>` (`libs_patch.rs` in goldberg-patcher).
+/// `(lib, path)` pairs under `extract_dir`. gbe_fork archives nest payload
+/// DLLs at `release/regular/<arch>/<name>` (`libs_patch.rs` in
+/// goldberg-patcher).
 ///
-/// `arch` is `"x32"` | `"x64"`; on Linux builds the archive uses the same
-/// folder layout.
-pub fn emulator_payload_paths(extract_dir: &Path, arch: &str, libs: &[&str]) -> Vec<PathBuf> {
+/// `arch_for` maps each lib to its ABI folder — resolution is by the
+/// TARGET's ABI, not the host (32-bit `steam_api.dll` → `x32` even on an
+/// x86_64 host). Libs whose ABI is unknown map to `None` and are omitted
+/// from the result.
+pub fn emulator_payload_paths(
+    extract_dir: &Path,
+    arch_for: impl Fn(&str) -> Option<&'static str>,
+    libs: &[&str],
+) -> Vec<(String, PathBuf)> {
     libs.iter()
-        .map(|lib| {
-            extract_dir
-                .join("release")
-                .join("regular")
-                .join(arch)
-                .join(lib)
+        .filter_map(|lib| {
+            arch_for(lib).map(|arch| {
+                (
+                    lib.to_string(),
+                    extract_dir
+                        .join("release")
+                        .join("regular")
+                        .join(arch)
+                        .join(lib),
+                )
+            })
         })
         .collect()
 }
@@ -115,7 +164,7 @@ mod tests {
     use tempfile::TempDir;
 
     const PAYLOAD: &[u8] = b"fake-emulator-archive-bytes";
-    const GOOD_DIGEST: &str = "3a3f2b0e1c5d4a6f8b9c0d1e2f3a4b5c6d7e8f90123456789abcdef01234567";
+    const GOOD_DIGEST: &str = "a3f2b0e1c5d4a6f8b9c0d1e2f3a4b5c6d7e8f90123456789abcdef0123456789";
 
     fn digest_of(data: &[u8]) -> String {
         to_hex(&Sha256::digest(data))
@@ -124,11 +173,8 @@ mod tests {
     #[tokio::test]
     async fn downloads_and_verifies() {
         let tmp = TempDir::new().unwrap();
-        let spec = ReleaseSpec {
-            tag: "v0.9.9".into(),
-            asset_name: GBE_WIN_ASSET.into(),
-            sha256: digest_of(PAYLOAD),
-        };
+        let spec =
+            ReleaseSpec::new("v0.9.9".into(), GBE_WIN_ASSET.into(), digest_of(PAYLOAD)).unwrap();
         let served = std::sync::Arc::new(std::sync::Mutex::new(0u32));
         let s2 = served.clone();
         let path = ensure_cached(tmp.path(), &spec, move |_url, dest| async move {
@@ -144,11 +190,8 @@ mod tests {
     #[tokio::test]
     async fn digest_mismatch_aborts_and_cleans_up() {
         let tmp = TempDir::new().unwrap();
-        let spec = ReleaseSpec {
-            tag: "v0.9.9".into(),
-            asset_name: GBE_WIN_ASSET.into(),
-            sha256: GOOD_DIGEST.into(), // wrong on purpose
-        };
+        let spec =
+            ReleaseSpec::new("v0.9.9".into(), GBE_WIN_ASSET.into(), GOOD_DIGEST.into()).unwrap(); // well-formed but WRONG digest on purpose
         let err = ensure_cached(tmp.path(), &spec, |_url, dest| async move {
             fs::write(dest, PAYLOAD).await.map_err(EngineError::from)
         })
@@ -162,11 +205,8 @@ mod tests {
     #[tokio::test]
     async fn second_call_is_cache_hit_without_download() {
         let tmp = TempDir::new().unwrap();
-        let spec = ReleaseSpec {
-            tag: "v0.9.9".into(),
-            asset_name: GBE_LINUX_ASSET.into(),
-            sha256: digest_of(PAYLOAD),
-        };
+        let spec =
+            ReleaseSpec::new("v0.9.9".into(), GBE_LINUX_ASSET.into(), digest_of(PAYLOAD)).unwrap();
         let calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
         let c2 = calls.clone();
         // Fn closure (not FnOnce) so the same downloader can serve both calls.
@@ -200,11 +240,8 @@ mod tests {
     #[tokio::test]
     async fn corrupt_cache_is_replaced_not_trusted() {
         let tmp = TempDir::new().unwrap();
-        let spec = ReleaseSpec {
-            tag: "v0.9.9".into(),
-            asset_name: GBE_WIN_ASSET.into(),
-            sha256: digest_of(PAYLOAD),
-        };
+        let spec =
+            ReleaseSpec::new("v0.9.9".into(), GBE_WIN_ASSET.into(), digest_of(PAYLOAD)).unwrap();
         // Plant garbage where a valid cache entry would live.
         fs::write(cache_path(tmp.path(), &spec), b"garbage")
             .await
@@ -221,12 +258,46 @@ mod tests {
     #[test]
     fn payload_paths_follow_archive_layout() {
         let root = Path::new("/tmp/x");
-        let paths = emulator_payload_paths(root, "x64", &["steam_api64.dll", "steamclient64.dll"]);
+        // Per-TARGET ABI: 32-bit names → x32 even on an x86_64 host.
+        let arch_for = |lib: &str| match lib {
+            "steam_api.dll" | "steamclient.dll" => Some("x32"),
+            _ => Some("x64"),
+        };
+        let paths = emulator_payload_paths(
+            root,
+            arch_for,
+            &["steam_api.dll", "steam_api64.dll", "steamclient64.dll"],
+        );
         assert_eq!(
-            paths[0],
+            paths[0].1,
+            root.join("release/regular/x32/steam_api.dll"),
+            "32-bit targets resolve to x32 regardless of host"
+        );
+        assert_eq!(
+            paths[1].1,
             root.join("release/regular/x64/steam_api64.dll"),
             "gbe_fork archives use release/regular/<arch>/<lib>"
         );
-        assert_eq!(paths[1], root.join("release/regular/x64/steamclient64.dll"));
+        assert_eq!(paths[2].0, "steamclient64.dll");
+    }
+
+    #[test]
+    fn unknown_abi_is_omitted_not_mispathed() {
+        let root = Path::new("/tmp/x");
+        let paths = emulator_payload_paths(root, |_| None, &["steam_api64.dll"]);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn release_spec_validation() {
+        assert!(ReleaseSpec::new("v1".into(), "a.7z".into(), digest_of(b"x")).is_ok());
+        // Wrong digest length / charset rejected.
+        assert!(ReleaseSpec::new("v1".into(), "a.7z".into(), "abc".into()).is_err());
+        assert!(ReleaseSpec::new("v1".into(), "a.7z".into(), "Z".repeat(64)).is_err());
+        // Path traversal in tag or asset rejected.
+        assert!(ReleaseSpec::new("../evil".into(), "a.7z".into(), digest_of(b"x")).is_err());
+        assert!(ReleaseSpec::new("v1".into(), "sub/dir.7z".into(), digest_of(b"x")).is_err());
+        // Empty values rejected.
+        assert!(ReleaseSpec::new(String::new(), "a.7z".into(), digest_of(b"x")).is_err());
     }
 }
