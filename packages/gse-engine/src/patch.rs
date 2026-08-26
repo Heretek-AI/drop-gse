@@ -72,6 +72,13 @@ fn locate_targets(root: &Path, names: &[&str], depth: usize) -> Result<Vec<PathB
     Ok(hits)
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Execute the full patch pipeline against `game_dir`.
 ///
 /// `emulator_payloads` maps each target binary name to the freshly-fetched
@@ -106,47 +113,50 @@ pub fn patch(
             .to_string_lossy()
             .to_string();
 
-        // 3a. Interfaces must come from the ORIGINAL — extract before any
-        //     replacement touches this file.
+        // 3b-first: determine backup state BEFORE choosing the interface
+        // source — on a re-run the live file is the emulator payload, so
+        // interfaces must come from the `.orig` original.
+        //
+        // Pass the RELATIVE path (which may include subdirectories) so
+        // backup, replacement and restore all address the same file; name-
+        // only resolution would miss or mis-address nested targets. The
+        // manifest keys and backup files are derived from this relative
+        // name (`<rel>` → `<rel>.orig`).
+        let outcome = dll::backup_originals(game_dir, &[rel.as_str()])?;
+        let rel_backup = format!("{rel}.orig");
+
+        // 3a. Interfaces must come from the ORIGINAL binary — prefer the
+        //     verified `.orig` when present, else the not-yet-replaced file.
         if interfaces.is_empty() {
-            interfaces = crate::interfaces::extract_interfaces(path)?;
+            let orig_abs = game_dir.join(&rel_backup);
+            let source = if orig_abs.exists() {
+                orig_abs
+            } else {
+                path.clone()
+            };
+            interfaces = crate::interfaces::extract_interfaces(&source)?;
         }
 
-        // 3b. Hash-manifested backup (idempotent; preserves originals across
-        //     re-runs over patched binaries).
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let outcome = dll::backup_originals(game_dir, &[name.as_ref()])?;
-
-        match outcome.state(name.as_ref()) {
+        match outcome.state(rel.as_str()) {
             Some(dll::BackupState::AlreadyPatched) => {
                 targets.insert(rel.clone(), TargetState::AlreadyPatched);
             }
             Some(dll::BackupState::BackedUp) => {
                 // 4. Replace with the fetched emulator payload.
-                let payload = emulator_payloads.get(name.as_ref()).ok_or_else(|| {
-                    EngineError::Fetch(format!("no emulator payload provided for {name}"))
-                })?;
+                let payload = emulator_payloads
+                    .get(file_name(path).as_str())
+                    .ok_or_else(|| {
+                        EngineError::Fetch(format!(
+                            "no emulator payload provided for {}",
+                            file_name(path)
+                        ))
+                    })?;
                 std::fs::copy(payload, path)?;
                 targets.insert(rel.clone(), TargetState::Patched);
                 replaced_any = true;
             }
             None => {
                 targets.insert(rel.clone(), TargetState::Skipped);
-            }
-        }
-    }
-
-    // Interfaces may still be empty if every target was already patched on an
-    // earlier run (originals are .orig then) — recover from the backup.
-    if interfaces.is_empty() {
-        for path in &target_paths {
-            let orig = path.with_file_name(format!(
-                "{}.orig",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            if orig.exists() {
-                interfaces = crate::interfaces::extract_interfaces(&orig)?;
-                break;
             }
         }
     }

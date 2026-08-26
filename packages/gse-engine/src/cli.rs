@@ -139,17 +139,34 @@ pub fn run(cli: Cli) -> Result<String, EngineError> {
             let extract_root = cache.join(format!("extracted-{}", spec.sha256));
             extract_archive(&archive, &extract_root, &spec.asset_name)?;
 
-            // Map target names → extracted payload paths (release/regular/<arch>).
-            let arch = target_arch_folder();
-            let wanted: Vec<&str> = dll::TARGET_BINARIES.to_vec();
+            // Map target names → extracted payload paths. Each target binary
+            // resolves against its OWN ABI folder in the archive (32-bit
+            // `steam_api.dll` lives under x32 even on an x86_64 host);
+            // targets whose payload is absent from the pinned archive are
+            // omitted so patch() skips them rather than half-failing after
+            // backups have started.
             let mut payloads = BTreeMap::new();
-            for lib in &wanted {
-                let p = fetch::emulator_payload_paths(&extract_root, arch, &[lib])
-                    .pop()
-                    .expect("one path per lib");
-                if p.exists() {
-                    payloads.insert(lib.to_string(), p);
+            for lib in dll::TARGET_BINARIES {
+                let abi = target_abi_folder(lib);
+                match abi {
+                    Some(arch) => {
+                        let p = fetch::emulator_payload_paths(&extract_root, arch, &[lib])
+                            .pop()
+                            .expect("one path per lib");
+                        if p.exists() {
+                            payloads.insert(lib.to_string(), p);
+                        }
+                    }
+                    None => continue, // unsupported ABI for this binary
                 }
+            }
+            if payloads.is_empty() {
+                return Err(EngineError::Fetch(format!(
+                    "pinned archive {} contains none of the required payloads \
+                     for this platform ({})",
+                    spec.asset_name,
+                    std::env::consts::ARCH,
+                )));
             }
 
             let plan = PatchPlan {
@@ -164,16 +181,27 @@ pub fn run(cli: Cli) -> Result<String, EngineError> {
     }
 }
 
-/// Host architecture → gbe_fork archive folder name.
-fn target_arch_folder() -> &'static str {
-    if cfg!(target_arch = "x86_64") {
-        "x64"
-    } else if cfg!(target_arch = "x86") {
-        "x32"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x64"
+/// Target binary → gbe_fork archive ABI folder. Resolution is by the
+/// TARGET's ABI, not the host: `steam_api.dll` / `steamclient.dll` are 32-bit
+/// and live under `x32` even when running on an x86_64 host; the `64`-suffixed
+/// names live under `x64`. Returns `None` for binaries whose ABI has no
+/// folder in gbe_fork archives (e.g. an aarch64 build), letting the caller
+/// skip them explicitly instead of resolving a wrong path.
+fn target_abi_folder(binary_name: &str) -> Option<&'static str> {
+    match binary_name {
+        "steam_api.dll" | "steamclient.dll" => Some("x32"),
+        "steam_api64.dll" | "steamclient64.dll" => Some("x64"),
+        // libsteam_api.so exists in both x32/x64 archive folders; pick by
+        // host so Linux native patching grabs the matching bitness.
+        "libsteam_api.so" => {
+            if cfg!(target_arch = "x86") {
+                Some("x32")
+            } else {
+                Some("x64")
+            }
+        }
+        _ if cfg!(target_arch = "aarch64") => None, // no aarch64 folder upstream
+        _ => None,
     }
 }
 

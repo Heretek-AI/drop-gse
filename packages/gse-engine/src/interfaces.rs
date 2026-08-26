@@ -19,51 +19,65 @@ const BUFFER_SIZE: usize = 64 * 1024;
 /// boundaries are still matched, matching GoldbergScanner.cs.
 const OVERLAP: usize = 1024;
 
-/// Interface-family prefixes scanned for, in the same order as
-/// GoldbergScanner.cs. Each is matched as `<Prefix>\d+`.
+/// Interface patterns, verbatim from gbe_fork's own extraction tool
+/// (`tools/generate_interfaces/generate_interfaces.cpp`,
+/// `interface_patterns`) — the authoritative list the emulator itself uses.
+/// This supersedes the earlier SteamRoll-derived set: it adds the uppercase
+/// `STEAM*_INTERFACE_VERSION*` families (e.g.
+/// `STEAMUSERSTATS_INTERFACE_VERSION001`), `SteamMatchMakingServers` /
+/// `SteamMatchGameSearch`, `SteamGameCoordinator`, `SteamMasterServerUpdater`
+/// and friends that the SteamRoll list missed.
 ///
-/// Note the quirks preserved from the reference: `SteamMatchMaking` has a
-/// capital "M", and plain `SteamNetworking` is distinct from the
-/// `SteamNetworking{Messages,Sockets,Utils}` family.
-const INTERFACE_PREFIXES: &[&str] = &[
-    "SteamClient",
-    "SteamUser",
-    "SteamFriends",
-    "SteamUtils",
-    "SteamMatchMaking",
-    "SteamUserStats",
-    "SteamApps",
-    "SteamNetworking",
-    "SteamRemoteStorage",
-    "SteamScreenshots",
-    "SteamHTTP",
-    "SteamController",
-    "SteamUGC",
-    "SteamAppList",
-    "SteamMusic",
-    "SteamMusicRemote",
-    "SteamHTMLSurface",
-    "SteamInventory",
-    "SteamVideo",
-    "SteamParentalSettings",
-    "SteamInput",
-    "SteamParties",
-    "SteamRemotePlay",
-    "SteamNetworkingMessages",
-    "SteamNetworkingSockets",
-    "SteamNetworkingUtils",
-    "SteamGameServer",
-    "SteamGameServerStats",
+/// Ordering matters within overlapping prefixes: longer/specific names first
+/// (`SteamMatchMakingServers\d+` before `SteamMatchMaking\d+`,
+/// `SteamNetworkingSockets\d+` before `SteamNetworking\d+`) so dedupe keeps
+/// the most specific match — same convention as the upstream tool.
+const INTERFACE_PATTERNS: &[&str] = &[
+    r"STEAMAPPS_INTERFACE_VERSION\d+",
+    r"SteamApps\d+",
+    r"STEAMAPPLIST_INTERFACE_VERSION\d+",
+    r"STEAMAPPTICKET_INTERFACE_VERSION\d+",
+    r"SteamClient\d+",
+    // No trailing \d+: matches the literal version string form used by this
+    // interface in the SDK (upstream pattern has no digit suffix either).
+    r"STEAMCONTROLLER_INTERFACE_VERSION",
+    r"SteamController\d+",
+    r"SteamFriends\d+",
+    r"SteamGameServerStats\d+",
+    r"SteamGameCoordinator\d+",
+    r"SteamGameServer\d+",
+    r"STEAMHTMLSURFACE_INTERFACE_VERSION_\d+",
+    r"STEAMHTTP_INTERFACE_VERSION\d+",
+    r"SteamInput\d+",
+    r"STEAMINVENTORY_INTERFACE_V\d+",
+    r"SteamMatchMakingServers\d+",
+    r"SteamMatchMaking\d+",
+    r"SteamMatchGameSearch\d+",
+    r"SteamParties\d+",
+    r"STEAMMUSIC_INTERFACE_VERSION\d+",
+    r"STEAMMUSICREMOTE_INTERFACE_VERSION\d+",
+    r"SteamNetworkingMessages\d+",
+    r"SteamNetworkingSockets\d+",
+    r"SteamNetworkingUtils\d+",
+    r"SteamNetworking\d+",
+    r"STEAMPARENTALSETTINGS_INTERFACE_VERSION\d+",
+    r"STEAMREMOTEPLAY_INTERFACE_VERSION\d+",
+    r"STEAMREMOTESTORAGE_INTERFACE_VERSION\d+",
+    r"STEAMSCREENSHOTS_INTERFACE_VERSION\d+",
+    r"STEAMTIMELINE_INTERFACE_V\d+",
+    r"STEAMUGC_INTERFACE_VERSION\d+",
+    r"SteamUser\d+",
+    r"STEAMUSERSTATS_INTERFACE_VERSION\d+",
+    r"SteamUtils\d+",
+    r"STEAMVIDEO_INTERFACE_V\d+",
+    r"STEAMUNIFIEDMESSAGES_INTERFACE_VERSION\d+",
+    r"SteamMasterServerUpdater\d+",
 ];
 
-/// Compile one regex per interface family: `^(Prefix)\d+$` applied to
-/// whitespace-bounded tokens, or simply `Prefix\d+` over raw chunks. We use
-/// plain `Prefix\d+` like the C# original — interface strings are unique
-/// enough that false positives are not a practical concern.
 fn compile_patterns() -> Vec<Regex> {
-    INTERFACE_PREFIXES
+    INTERFACE_PATTERNS
         .iter()
-        .map(|p| Regex::new(&format!(r"{p}\d+")).expect("static pattern"))
+        .map(|p| Regex::new(p).expect("static pattern"))
         .collect()
 }
 
@@ -163,6 +177,42 @@ mod tests {
     fn ignores_partial_names_without_version_digits() {
         let blob = b"SteamUserNoVersion SteamUser";
         assert!(extract_interfaces_from_bytes(blob).is_empty());
+    }
+
+    #[test]
+    fn matches_uppercase_interface_version_families() {
+        let blob = b"STEAMUSERSTATS_INTERFACE_VERSION001\x00STEAMUGC_INTERFACE_VERSION015\x00STEAMTIMELINE_INTERFACE_V001\x00STEAMCONTROLLER_INTERFACE_VERSION";
+        let got = extract_interfaces_from_bytes(blob);
+        assert_eq!(
+            got,
+            vec![
+                "STEAMCONTROLLER_INTERFACE_VERSION",
+                "STEAMTIMELINE_INTERFACE_V001",
+                "STEAMUGC_INTERFACE_VERSION015",
+                "STEAMUSERSTATS_INTERFACE_VERSION001",
+            ]
+        );
+    }
+
+    #[test]
+    fn matchmaking_servers_not_truncated_by_generic_prefix() {
+        // The specific name must win over the generic prefix match.
+        let blob = b"SteamMatchMakingServers002\x00SteamMatchMaking009\x00";
+        let got = extract_interfaces_from_bytes(blob);
+        assert_eq!(
+            got,
+            vec!["SteamMatchMaking009", "SteamMatchMakingServers002"]
+        );
+    }
+
+    #[test]
+    fn coordinator_and_master_server_updater_matched() {
+        let blob = b"SteamGameCoordinator001\x00SteamMasterServerUpdater002\x00";
+        let got = extract_interfaces_from_bytes(blob);
+        assert_eq!(
+            got,
+            vec!["SteamGameCoordinator001", "SteamMasterServerUpdater002"]
+        );
     }
 
     #[test]
