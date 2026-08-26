@@ -41,14 +41,18 @@ pub struct PatchReport {
     pub targets: std::collections::BTreeMap<String, TargetState>,
     /// Interface names extracted from the original binary.
     pub interfaces: Vec<String>,
+    /// How many targets were replaced this run (0 on an idempotent re-run) —
+    /// lets callers decide whether a relaunch is needed.
+    pub replaced_count: usize,
 }
 
 /// Recursively locate files named in `names` under `root`, depth-limited.
-/// Returns paths relative to `root`. Mirrors goldberg-patcher's
+/// Returns paths relative to `root`. The depth cap is the SAME constant the
+/// anticheat gate uses (`anticheat::MAX_SCAN_DEPTH`) — a target we can reach
+/// must always be inside scanned territory. Mirrors goldberg-patcher's
 /// `find_file_path` but bounded (spec §3.1 scanner constraints).
 fn locate_targets(root: &Path, names: &[&str], depth: usize) -> Result<Vec<PathBuf>, EngineError> {
-    const MAX_DEPTH: usize = 6;
-    if depth > MAX_DEPTH {
+    if depth > anticheat::MAX_SCAN_DEPTH {
         return Ok(Vec::new());
     }
     let mut hits = Vec::new();
@@ -104,7 +108,6 @@ pub fn patch(
 
     let mut targets = std::collections::BTreeMap::new();
     let mut interfaces = Vec::new();
-    let mut replaced_any = false;
 
     for path in &target_paths {
         let rel = path
@@ -142,18 +145,17 @@ pub fn patch(
                 targets.insert(rel.clone(), TargetState::AlreadyPatched);
             }
             Some(dll::BackupState::BackedUp) => {
-                // 4. Replace with the fetched emulator payload.
-                let payload = emulator_payloads
-                    .get(file_name(path).as_str())
-                    .ok_or_else(|| {
-                        EngineError::Fetch(format!(
-                            "no emulator payload provided for {}",
-                            file_name(path)
-                        ))
-                    })?;
+                // 4. Replace with the fetched emulator payload. Lookup is by
+                // LOWERCASED file name: locate_targets matches
+                // case-insensitively but preserves on-disk casing, while the
+                // payload map is keyed by canonical lowercase names — a
+                // mixed-case target (STEAM_API64.DLL) must still resolve.
+                let lookup_key = file_name(path).to_lowercase();
+                let payload = emulator_payloads.get(lookup_key.as_str()).ok_or_else(|| {
+                    EngineError::Fetch(format!("no emulator payload provided for {lookup_key}"))
+                })?;
                 std::fs::copy(payload, path)?;
                 targets.insert(rel.clone(), TargetState::Patched);
-                replaced_any = true;
             }
             None => {
                 targets.insert(rel.clone(), TargetState::Skipped);
@@ -170,17 +172,25 @@ pub fn patch(
     };
     config::write_steam_settings(game_dir, &settings)?;
 
-    let _ = replaced_any;
+    let replaced_count = targets
+        .values()
+        .filter(|s| **s == TargetState::Patched)
+        .count();
     Ok(PatchReport {
         app_id: plan.app_id,
         targets,
         interfaces: settings.interfaces,
+        replaced_count,
     })
 }
 
 /// Restore all tracked originals and remove engine-written config files.
+///
+/// Manifest entries are keyed by the on-disk relative path (any casing), so
+/// restore enumerates the manifest itself rather than assuming canonical
+/// lowercase names — a mixed-case target must not be silently skipped here.
 pub fn restore(game_dir: &Path) -> Result<(), EngineError> {
-    dll::restore_originals(game_dir, dll::TARGET_BINARIES)?;
+    dll::restore_all_tracked(game_dir)?;
     config::remove_steam_settings(game_dir)?;
     Ok(())
 }

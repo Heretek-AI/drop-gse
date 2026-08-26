@@ -77,10 +77,22 @@ fn default_cache_dir() -> PathBuf {
     }
 }
 
-/// Blocking download used by the CLI (the library API is async; the CLI wraps
-/// it in a current-thread runtime).
+/// Download used by the CLI (the library API is async; the CLI wraps it in a
+/// current-thread runtime). Streams the body to disk — release archives are
+/// tens of MB and must not be buffered whole in memory — with explicit
+/// connect/request timeouts so a stalled server cannot hang the process, and
+/// writes to a UNIQUE staging file that is atomically renamed into place so a
+/// crash mid-download never leaves a partial artifact at the final path (and
+/// concurrent invocations cannot interleave or clobber each other's writes).
 async fn download(url: String, dest: PathBuf) -> Result<(), EngineError> {
-    let response = reqwest::get(&url)
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(15 * 60))
+        .build()
+        .map_err(|e| EngineError::Fetch(format!("client: {e}")))?;
+    let response = client
+        .get(&url)
+        .send()
         .await
         .map_err(|e| EngineError::Fetch(format!("{url}: {e}")))?;
     if !response.status().is_success() {
@@ -89,11 +101,31 @@ async fn download(url: String, dest: PathBuf) -> Result<(), EngineError> {
             response.status()
         )));
     }
-    let bytes = response
-        .bytes()
+
+    // Unique staging name: same directory (same filesystem → atomic rename),
+    // pid + monotonic counter suffix.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let staging = dest.with_extension(format!(
+        "part-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = tokio::fs::File::create(&staging)
         .await
-        .map_err(|e| EngineError::Fetch(format!("{url}: {e}")))?;
-    tokio::fs::write(&dest, &bytes)
+        .map_err(EngineError::from)?;
+    let mut stream = response;
+    while let Some(chunk) = stream
+        .chunk()
+        .await
+        .map_err(|e| EngineError::Fetch(format!("{url}: {e}")))?
+    {
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&chunk).await.map_err(EngineError::from)?;
+        file.flush().await.map_err(EngineError::from)?;
+    }
+    drop(file);
+    tokio::fs::rename(&staging, &dest)
         .await
         .map_err(EngineError::from)?;
     Ok(())
@@ -106,8 +138,7 @@ pub fn run(cli: Cli) -> Result<String, EngineError> {
             Ok(found.join("\n"))
         }
         Command::Restore { game_dir } => {
-            dll::restore_originals(&game_dir, dll::TARGET_BINARIES)?;
-            crate::config::remove_steam_settings(&game_dir)?;
+            crate::patch::restore(&game_dir)?;
             Ok(format!("restored originals in {}", game_dir.display()))
         }
         Command::Patch {
@@ -147,17 +178,19 @@ pub fn run(cli: Cli) -> Result<String, EngineError> {
             // backups have started.
             let mut payloads = BTreeMap::new();
             for lib in dll::TARGET_BINARIES {
-                let abi = target_abi_folder(lib);
-                match abi {
-                    Some(arch) => {
-                        let p = fetch::emulator_payload_paths(&extract_root, arch, &[lib])
-                            .pop()
-                            .expect("one path per lib");
-                        if p.exists() {
-                            payloads.insert(lib.to_string(), p);
-                        }
-                    }
+                let abi = match target_abi_folder(lib) {
+                    Some(a) => a,
                     None => continue, // unsupported ABI for this binary
+                };
+                // Construct the single payload path directly — no unwrap/expect
+                // in production plumbing.
+                let p = extract_root
+                    .join("release")
+                    .join("regular")
+                    .join(abi)
+                    .join(lib);
+                if p.exists() {
+                    payloads.insert(lib.to_string(), p);
                 }
             }
             if payloads.is_empty() {

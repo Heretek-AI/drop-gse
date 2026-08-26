@@ -223,6 +223,17 @@ pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), Engin
     Ok(())
 }
 
+/// Restore EVERY entry recorded in the manifest, whatever its on-disk casing
+/// or nesting. `restore_originals` filters by an explicit name list (canonical
+/// lowercase), which would silently skip a manifest entry like
+/// `bin/STEAM_API64.DLL`; this variant trusts the manifest itself — the same
+/// keys backup wrote — so nothing patched is ever left unrestored.
+pub fn restore_all_tracked(game_dir: &Path) -> Result<(), EngineError> {
+    let manifest = load_manifest(game_dir)?;
+    let tracked: Vec<&str> = manifest.entries.keys().map(String::as_str).collect();
+    restore_originals(game_dir, &tracked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
