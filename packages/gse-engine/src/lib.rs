@@ -9,13 +9,15 @@
 //! - `patch`     — orchestration of the full pipeline
 
 pub mod anticheat;
-pub mod cli;
 pub mod config;
 pub mod dll;
 pub mod error;
 pub mod fetch;
 pub mod interfaces;
 pub mod patch;
+
+#[cfg(feature = "cli")]
+pub mod cli;
 
 /// Target emulator distributions the engine can deploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

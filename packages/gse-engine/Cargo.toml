@@ -5,19 +5,42 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Core emulator patcher, DLL manager and config generator for drop-gse"
 
+[features]
+# The CLI binary (clap, dirs, archive codecs) is pulled in only when this
+# feature is on, so a library consumer — e.g. the Drop client addon embedding
+# this crate — never compiles arg parsing or archive codecs it doesn't use.
+default = ["cli"]
+cli = [
+  "dep:clap",
+  "dep:dirs",
+  "dep:bzip2",
+  "dep:tar",
+  "dep:sevenz-rust2",
+]
+
 [dependencies]
-bzip2 = "0.5"
-clap = { version = "4", features = ["derive"] }
-dirs = "6"
+bzip2 = { version = "0.5", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+dirs = { version = "6", optional = true }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sevenz-rust2 = "0.14"
+sevenz-rust2 = { version = "0.14", optional = true }
 sha2 = "0.11"
-tar = "0.4"
+tar = { version = "0.4", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+# Default features off: only the bits the engine actually uses. `fs` for
+# tokio::fs in fetch.rs/cli.rs, `io-util` for AsyncWriteExt (and not via
+# reqwest's transitive enablement — declared explicitly), `macros` for
+# #[tokio::test], `rt-multi-thread` for the CLI's current-thread runtime.
+tokio = { version = "1", default-features = false, features = [
+  "fs",
+  "io-util",
+  "macros",
+  "rt",
+  "rt-multi-thread",
+] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -25,6 +48,7 @@ tempfile = "3"
 [[bin]]
 name = "gse-engine"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [lib]
 path = "src/lib.rs"

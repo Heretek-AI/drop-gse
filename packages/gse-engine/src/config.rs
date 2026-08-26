@@ -122,13 +122,12 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), EngineError> {
 /// the binaries' backups. Goldberg users legitimately ship/edit
 /// steam_appid.txt and configs.main.ini; teardown can then restore their
 /// content instead of silently discarding it.
-/// Manifest key prefix marking a config file WE own (vs a binary backup).
-/// Namespaced so `restore_originals` — which interprets bare keys as binary
-/// `<key>` → `<key>.orig` pairs — never mistakes these for binaries.
-const CONFIG_KEY_PREFIX: &str = "config:";
-
+/// Manifest key prefix for config-file ownership entries. The single canonical
+/// declaration lives in [`crate::dll`] (namespaced so binary restore never
+/// mistakes them for `<path>` → `<path>.orig` backup pairs); this helper just
+/// wraps the prefix.
 fn config_key(name: &str) -> String {
-    format!("{CONFIG_KEY_PREFIX}{name}")
+    format!("{}{name}", crate::dll::CONFIG_KEY_PREFIX)
 }
 
 /// Snapshot a pre-existing settings file that WE did not author before our
@@ -216,7 +215,7 @@ pub fn write_steam_settings(
 
     // The patch manifest doubles as ownership ledger for config files so
     // snapshot/removal decisions distinguish "ours" from "user-authored".
-    let mut manifest = dll::load_manifest_pub(game_dir)?;
+    let mut manifest = dll::load_manifest(game_dir)?;
     let mut manifest_dirty = false;
 
     let mut written = Vec::new();
@@ -268,7 +267,7 @@ pub fn write_steam_settings(
     // Config digests here track that we OWN the entry, not exact content —
     // content equality is checked directly above before overwriting.
     if manifest_dirty {
-        dll::save_manifest_pub(game_dir, &manifest)?;
+        dll::save_manifest(game_dir, &manifest)?;
     }
     Ok(written)
 }
@@ -286,7 +285,7 @@ pub fn write_steam_settings(
 /// - No manifest entry → not ours; leave untouched.
 pub fn remove_steam_settings(game_dir: &Path) -> Result<(), EngineError> {
     let dir = game_dir.join(STEAM_SETTINGS_DIR);
-    let mut manifest = dll::load_manifest_pub(game_dir)?;
+    let mut manifest = dll::load_manifest(game_dir)?;
     let mut dirty = false;
     for name in [
         "steam_appid.txt",
@@ -308,7 +307,7 @@ pub fn remove_steam_settings(game_dir: &Path) -> Result<(), EngineError> {
         dirty = true;
     }
     if dirty {
-        dll::save_manifest_pub(game_dir, &manifest)?;
+        dll::save_manifest(game_dir, &manifest)?;
     }
     Ok(())
 }

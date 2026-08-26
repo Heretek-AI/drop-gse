@@ -51,11 +51,7 @@ fn manifest_path(game_dir: &Path) -> std::path::PathBuf {
     game_dir.join(MANIFEST_FILE)
 }
 
-pub fn load_manifest_pub(game_dir: &Path) -> Result<Manifest, EngineError> {
-    load_manifest(game_dir)
-}
-
-fn load_manifest(game_dir: &Path) -> Result<Manifest, EngineError> {
+pub(crate) fn load_manifest(game_dir: &Path) -> Result<Manifest, EngineError> {
     let path = manifest_path(game_dir);
     if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
@@ -66,11 +62,7 @@ fn load_manifest(game_dir: &Path) -> Result<Manifest, EngineError> {
     }
 }
 
-pub fn save_manifest_pub(game_dir: &Path, manifest: &Manifest) -> Result<(), EngineError> {
-    save_manifest(game_dir, manifest)
-}
-
-fn save_manifest(game_dir: &Path, manifest: &Manifest) -> Result<(), EngineError> {
+pub(crate) fn save_manifest(game_dir: &Path, manifest: &Manifest) -> Result<(), EngineError> {
     let raw = serde_json::to_string_pretty(manifest)?;
     std::fs::write(manifest_path(game_dir), raw)?;
     Ok(())
@@ -199,7 +191,18 @@ pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), Engin
         validate_relative_path(name)?;
     }
     let mut manifest = load_manifest(game_dir)?;
+    restore_originals_with_manifest(game_dir, binaries, &mut manifest)
+}
 
+/// Manifest-aware variant: reuses an already-loaded `Manifest` so
+/// `restore_all_tracked` doesn't double-read the JSON. Single persistence
+/// at the end instead of one-per-name matches the same pattern in
+/// `config::remove_steam_settings`.
+fn restore_originals_with_manifest(
+    game_dir: &Path,
+    binaries: &[&str],
+    manifest: &mut Manifest,
+) -> Result<(), EngineError> {
     // Phase 1: verify all tracked backups before touching anything.
     for name in binaries {
         let Some(recorded) = manifest.entries.get(*name) else {
@@ -230,8 +233,10 @@ pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), Engin
         std::fs::copy(&src, &dst)?;
     }
 
-    // Phase 3: durable cleanup — remove one backup at a time and persist
-    // progress after each success.
+    // Phase 3: durable cleanup — remove one backup at a time; persist
+    // the manifest ONCE at the end (the caller already validated the
+    // manifest is trustworthy when it supplied it).
+    let mut any = false;
     for name in binaries {
         if !manifest.entries.contains_key(*name) {
             continue;
@@ -239,7 +244,10 @@ pub fn restore_originals(game_dir: &Path, binaries: &[&str]) -> Result<(), Engin
         let src = game_dir.join(format!("{name}.orig"));
         std::fs::remove_file(&src)?;
         manifest.entries.remove(*name);
-        save_manifest(game_dir, &manifest)?;
+        any = true;
+    }
+    if any {
+        save_manifest(game_dir, manifest)?;
     }
     Ok(())
 }
@@ -266,8 +274,9 @@ fn validate_relative_path(name: &str) -> Result<(), EngineError> {
 
 /// Manifest key prefix marking config-file ownership entries (written by
 /// `config::write_steam_settings`). Namespaced so binary restore never
-/// mistakes them for `<path>` → `<path>.orig` backup pairs.
-pub const CONFIG_KEY_PREFIX: &str = "config:";
+/// mistakes them for `<path>` → `<path>.orig` backup pairs. The single
+/// canonical declaration lives here — `config` references it directly.
+pub(crate) const CONFIG_KEY_PREFIX: &str = "config:";
 
 /// Restore EVERY BINARY entry recorded in the manifest, whatever its on-disk
 /// casing or nesting. `restore_originals` filters by an explicit name list
@@ -279,17 +288,21 @@ pub const CONFIG_KEY_PREFIX: &str = "config:";
 /// `config::remove_steam_settings`, which runs alongside this in
 /// `patch::restore`.
 pub fn restore_all_tracked(game_dir: &Path) -> Result<(), EngineError> {
-    let manifest = load_manifest(game_dir)?;
-    let tracked: Vec<&str> = manifest
+    let mut manifest = load_manifest(game_dir)?;
+    let tracked: Vec<String> = manifest
         .entries
         .keys()
         .filter(|k| !k.starts_with(CONFIG_KEY_PREFIX))
-        .map(String::as_str)
+        .cloned()
         .collect();
     for key in &tracked {
         validate_relative_path(key)?;
     }
-    restore_originals(game_dir, &tracked)
+    // Thread the manifest through so we don't re-read + re-parse JSON and
+    // don't re-validate the same names. restore_originals_with_manifest
+    // persists once at the end.
+    let tracked_refs: Vec<&str> = tracked.iter().map(String::as_str).collect();
+    restore_originals_with_manifest(game_dir, &tracked_refs, &mut manifest)
 }
 
 #[cfg(test)]
