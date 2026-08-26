@@ -152,9 +152,44 @@ fn snapshot_user_file_if_untracked(
     ));
     if !backup.exists() {
         std::fs::copy(&target, &backup)?;
-        let digest = dll::sha256_hex_of(&backup)?;
-        manifest.entries.insert(key, digest);
-        *manifest_dirty = true;
+    }
+    // Record the digest of whatever snapshot is on disk — including a
+    // leftover from an earlier run whose manifest was lost. Without this the
+    // recorded digest would describe OUR managed content and teardown would
+    // treat the genuine user snapshot as tampered and delete it.
+    let digest = dll::sha256_hex_of(&backup)?;
+    manifest.entries.insert(key, digest);
+    *manifest_dirty = true;
+    Ok(())
+}
+
+/// Restore a snapshotted user file at `<name>.orig` to its live path if the
+/// recorded digest matches. A mismatch is treated as tampering (the snapshot
+/// is removed; nothing resurrected). Any read/hash error propagates rather
+/// than silently dropping the snapshot.
+fn restore_snapshot_if_present(
+    dir: &Path,
+    name: &str,
+    manifest: &dll::Manifest,
+) -> Result<(), EngineError> {
+    let key = config_key(name);
+    let Some(recorded) = manifest.entries.get(&key) else {
+        return Ok(()); // never snapshotted — nothing to restore
+    };
+    let path = dir.join(name);
+    let backup = path.with_file_name(format!(
+        "{}.orig",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if !backup.exists() {
+        return Ok(());
+    }
+    let digest = dll::sha256_hex_of(&backup)?;
+    if digest == *recorded {
+        std::fs::rename(&backup, &path)?; // restore user content
+    } else {
+        // Snapshot tampered: refuse to resurrect possibly-wrong content.
+        std::fs::remove_file(&backup)?;
     }
     Ok(())
 }
@@ -198,18 +233,13 @@ pub fn write_steam_settings(
             None => {
                 // Setting reverted to empty/default: drop OUR previous output
                 // rather than leaving stale broadcasts/port overrides active.
-                // Never delete a file we didn't author.
+                // A snapshot means the user authored this file before we
+                // overwrote it — RESTORE their content instead of deleting
+                // it (the downgrade path must match the teardown guarantee).
                 let key = config_key(name);
                 if path.exists() && manifest.entries.contains_key(&key) {
                     std::fs::remove_file(&path)?;
-                    // Also remove our snapshot so teardown is fully clean.
-                    let backup = path.with_file_name(format!(
-                        "{}.orig",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                    if backup.exists() {
-                        std::fs::remove_file(&backup)?;
-                    }
+                    restore_snapshot_if_present(&dir, name, &manifest)?;
                     manifest.entries.remove(&key);
                     manifest_dirty = true;
                 }
@@ -265,28 +295,15 @@ pub fn remove_steam_settings(game_dir: &Path) -> Result<(), EngineError> {
         "configs.main.ini",
     ] {
         let key = config_key(name);
-        let Some(recorded) = manifest.entries.get(&key) else {
+        if !manifest.entries.contains_key(&key) {
             continue; // never authored/snapshotted by us — leave untouched
-        };
+        }
         let path = dir.join(name);
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
         // Restore the user's pre-patch file if we snapshotted one.
-        let backup = path.with_file_name(format!(
-            "{}.orig",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        if backup.exists() {
-            let digest = dll::sha256_hex_of(&backup).unwrap_or_default();
-            if digest == *recorded {
-                std::fs::rename(&backup, &path)?; // restore user content
-            } else {
-                // Snapshot tampered: refuse to resurrect possibly-wrong
-                // content; drop both and report through the manifest state.
-                std::fs::remove_file(&backup)?;
-            }
-        }
+        restore_snapshot_if_present(&dir, name, &manifest)?;
         manifest.entries.remove(&key);
         dirty = true;
     }
@@ -474,6 +491,65 @@ mod tests {
             fs::read_to_string(settings_dir.join("custom_broadcasts.txt")).unwrap(),
             "10.0.0.1\n",
             "files we never authored must survive even on downgrade"
+        );
+    }
+
+    #[test]
+    fn downgrade_restores_snapshot_not_deletes() {
+        let dir = tmpdir("downgrade-restore");
+        let settings_dir = dir.path().join(STEAM_SETTINGS_DIR);
+        fs::create_dir_all(&settings_dir).unwrap();
+        // User authored broadcasts file.
+        fs::write(settings_dir.join("custom_broadcasts.txt"), b"9.9.9.9\n").unwrap();
+
+        let mut s1 = sample_settings();
+        s1.interfaces.clear();
+        write_steam_settings(dir.path(), &s1).unwrap(); // snapshot + overwrite
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("custom_broadcasts.txt")).unwrap(),
+            "100.64.0.2\n100.64.0.3\n"
+        );
+        assert!(settings_dir.join("custom_broadcasts.txt.orig").exists());
+
+        // Downgrade: field empty, our file tracked, snapshot present →
+        // the snapshot must be restored (the user content is preserved),
+        // NOT deleted.
+        let mut s2 = sample_settings();
+        s2.interfaces.clear();
+        s2.custom_broadcasts.clear();
+        write_steam_settings(dir.path(), &s2).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("custom_broadcasts.txt")).unwrap(),
+            "9.9.9.9\n",
+            "downgrade must restore the user snapshot, not delete it"
+        );
+        assert!(!settings_dir.join("custom_broadcasts.txt.orig").exists());
+    }
+
+    #[test]
+    fn leftover_snapshot_is_recorded_in_manifest() {
+        // Simulate an existing `.orig` from a prior run whose manifest was
+        // lost: we must record the digest of the leftover (not of our new
+        // managed content), otherwise teardown treats the user file as tampered
+        // and drops it.
+        let dir = tmpdir("leftover");
+        let settings_dir = dir.path().join(STEAM_SETTINGS_DIR);
+        fs::create_dir_all(&settings_dir).unwrap();
+        // Live user file + a pre-existing snapshot with the same content.
+        fs::write(settings_dir.join("steam_appid.txt"), b"9999\n").unwrap();
+        fs::write(settings_dir.join("steam_appid.txt.orig"), b"9999\n").unwrap();
+
+        let mut s = sample_settings();
+        s.custom_broadcasts.clear();
+        s.interfaces.clear();
+        write_steam_settings(dir.path(), &s).unwrap();
+
+        // Teardown restores the (genuine) user content via digest match.
+        remove_steam_settings(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(settings_dir.join("steam_appid.txt")).unwrap(),
+            "9999\n"
         );
     }
 }

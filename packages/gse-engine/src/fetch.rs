@@ -105,12 +105,22 @@ where
     }
 
     fs::create_dir_all(cache_dir).await?;
-    // Download to a STAGING path first; the caller's downloader is responsible
-    // for atomic placement at that staging path. The final digest-keyed name
-    // only ever appears once the artifact has passed verification below, so
-    // concurrent invocations can't observe each other's partial writes.
-    let staging = cached.with_extension("staging");
-    download_to(spec.url(), staging.clone()).await?;
+    // Download to a UNIQUE staging sibling per call — concurrent cache misses
+    // for the same digest must not share a staging path (one invocation could
+    // rename/remove it while another is still hashing it). The caller's
+    // downloader is responsible for atomic placement at that staging path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let staging = cached.with_extension(format!(
+        "staging-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let download_result = download_to(spec.url(), staging.clone()).await;
+    if let Err(err) = download_result {
+        let _ = fs::remove_file(&staging).await; // no partial leftovers
+        return Err(err);
+    }
 
     let actual = sha256_of(&staging).await?;
     if actual != spec.sha256 {
@@ -122,10 +132,31 @@ where
             found: actual,
         });
     }
-    // Digest verified at the staging path — only NOW does it earn the final
-    // digest-keyed name (atomic within the same filesystem).
-    fs::rename(&staging, &cached).await?;
-    Ok(cached)
+    // Digest verified at the staging path. Another invocation may have won
+    // the promotion race while we hashed: if the final file now exists with
+    // the expected digest, it IS our artifact — treat as a cache hit.
+    if cached.is_file() && sha256_of(&cached).await? == spec.sha256 {
+        let _ = fs::remove_file(&staging).await; // discard our duplicate copy
+        return Ok(cached);
+    }
+    // Only NOW does the artifact earn the final digest-keyed name (atomic
+    // within the same filesystem).
+    match fs::rename(&staging, &cached).await {
+        Ok(()) => Ok(cached),
+        Err(_) => {
+            // Lost a rename race (e.g. Windows destination-exists semantics):
+            // re-verify the winner and succeed or fail on its merits.
+            if cached.is_file() && sha256_of(&cached).await? == spec.sha256 {
+                let _ = fs::remove_file(&staging).await;
+                Ok(cached)
+            } else {
+                Err(EngineError::Fetch(format!(
+                    "failed to promote verified download to {}: race lost with unverified file",
+                    cached.display()
+                )))
+            }
+        }
+    }
 }
 
 /// Locate `wanted` files inside the archive root once extracted, returning
