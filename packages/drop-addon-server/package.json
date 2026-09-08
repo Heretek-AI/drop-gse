@@ -11,6 +11,6 @@
     "test": "echo 'no tests yet' && exit 0"
   },
   "devDependencies": {
-    "typescript": "^5.7.2"
+    "typescript": "^7.0.2"
   }
 }

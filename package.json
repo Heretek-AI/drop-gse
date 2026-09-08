@@ -22,7 +22,7 @@
     "@typescript-eslint/parser": "^8.18.0",
     "eslint": "^10.9.1",
     "prettier": "^3.4.2",
-    "typescript": "^5.7.2",
+    "typescript": "^7.0.2",
     "typescript-eslint": "^8.68.0"
   },
   "engines": {
